@@ -1,78 +1,111 @@
-# 示例插件：nginx 显示一个网页，向登录的人问好。改成自己的应用见 https://github.com/wontonapp/wonton-docs/blob/main/develop.md#写插件。
+# Obsidian LiveSync 同步后端：CouchDB 单节点。电脑版 Obsidian 装社区插件 Self-hosted LiveSync，
+# 经局域网端口连到这里，多台电脑的笔记实时同步，数据都在自己家里。
+# 手机端要 HTTPS 才能连（上游文档明确要求），当前底座没有局域网 HTTPS 入口，见 README 已知限制。
 services:
-  web:
-    # 镜像按摘要固定（多架构镜像写清单列表的摘要），标签只给人看。
-    image: nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
+  couchdb:
+    # 上游官方镜像，按清单列表（index）的摘要固定；amd64 和 arm64 都有。
+    image: couchdb:3.5.3@sha256:907eab5b7e55ab7cfd241d39b90b2a335ea40bef82acee5a37388c08bf201dda
+    # 不写 user：镜像入口脚本以 root 修 /opt/couchdb 属主、写入 docker.ini 后再降回 5984（上游镜像约定），
+    # 数据目录随之归 5984:5984（上游 setup_own_server.md 也这么提示）。
     environment:
-      # 网关代登录：SSI 回显的 Remote-User 只信核心带来的。官方镜像启动时对 templates 目录里的
-      # *.template 做 envsubst，把下面的地址换进 nginx 配置（见 web/default.conf.template）。
-      WONTON_CORE_ADDRESS: ${WONTON_CORE_ADDRESS}
-    # 包里的文件经 configs 交给容器（核心在启动前写进去），不能用卷挂载。
+      # 管理员账号由镜像入口脚本写进 local.d/docker.ini；密码是核心生成的密钥。
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: ${WONTON_SECRET_ADMIN_PASSWORD}
+    volumes:
+      - ${WONTON_APP_DATA}/data:/opt/couchdb/data
+    # LiveSync 要求的服务端配置（单节点、登录必填、CORS、大小上限），值与上游文档一致。
     configs:
-      - source: site
-        target: /etc/nginx/templates/default.conf.template
-      - source: page
-        target: /usr/share/nginx/html/index.html
-      - source: tokens
-        target: /usr/share/nginx/html/tokens.css
+      - source: livesync-config
+        target: /opt/couchdb/etc/local.d/obsidian.ini
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      # 镜像里没有 curl/wget：用 bash 的 /dev/tcp 请求 /_up。
+      # require_valid_user=true 时 /_up 也要登录，带管理员凭据（实测 401→带凭据 200）。
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/5984 && printf "GET /_up HTTP/1.0\r\nHost: localhost\r\nAuthorization: Basic %s\r\n\r\n" "$$(printf "%s:%s" "$$COUCHDB_USER" "$$COUCHDB_PASSWORD" | base64 -w 0)" >&3 && head -1 <&3 | grep -q " 200 "'
       interval: 30s
       timeout: 5s
       start_period: 30s
       start_interval: 1s
 
+  # 一次性服务：等 CouchDB 健康后建库、建客户端账号、设库权限，并核验 CORS 与账号真的可用；失败即停。
+  # 每次创建容器都会重跑，全部动作幂等。
+  init:
+    image: curlimages/curl:8.18.0@sha256:d94d07ba9e7d6de898b6d96c1a072f6f8266c687af78a74f380087a0addf5d17
+    entrypoint: ["/bin/sh", "/init.sh"]
+    environment:
+      COUCHDB_USER: admin
+      WONTON_SECRET_ADMIN_PASSWORD: ${WONTON_SECRET_ADMIN_PASSWORD}
+      WONTON_OWNER_NAME: ${WONTON_OWNER_NAME:?核心没有注入用户名}
+      WONTON_SECRET_CLIENT_PASSWORD: ${WONTON_SECRET_CLIENT_PASSWORD}
+    configs:
+      - source: init-script
+        target: /init.sh
+    depends_on:
+      couchdb:
+        condition: service_healthy
+    restart: "no"
+
 configs:
-  site:
-    file: web/default.conf.template
-  page:
-    file: web/index.html
-  tokens:
-    file: web/tokens.css
+  livesync-config:
+    file: couchdb.ini
+  init-script:
+    file: init.sh
 
 x-wonton:
-  spec: "0.6"
-  # 换成你自己的：反向域名形式，装上以后不能改。
-  id: app.example.hello
-  version: 0.1.1
+  spec: "0.11"
+  id: io.github.vrtmrz.obsidian-livesync
+  version: 0.1.0
   kind: app
-  title: { zh: 你好, en: Hello }
-  description: { zh: 向登录的人问好的示例网页, en: An example page that greets whoever is signed in }
+  title: { zh: 笔记同步（Obsidian LiveSync）, en: Note Sync (Obsidian LiveSync) }
+  description:
+    zh: 像 Obsidian 官方的同步服务，让家里几台电脑上的笔记实时保持一致，数据存在自己家里，不用付订阅费。手机要 HTTPS 才能连，暂时不支持手机。
+    en: Like the official Obsidian Sync, keeping notes on your computers in sync through your own server at home, no subscription. Phones need HTTPS and are not supported yet.
   icon: icon.svg
   notices: [NOTICE]
-  screenshots: [screenshots/home.png]
-  author: { name: Example }
-  homepage: https://nginx.org
-  # 应用（这里是 nginx）的许可证；插件包自己的许可证写在仓库的 LICENSE 里。
-  license: BSD-2-Clause
+  author: { name: geraldpeng6 }
+  homepage: https://github.com/vrtmrz/obsidian-livesync
+  # 服务端是 Apache CouchDB（Apache-2.0）；客户端插件 Self-hosted LiveSync 是 MIT，见 README。
+  license: Apache-2.0
   tags:
-    zh: [工具]
-    en: [Tools]
+    zh: [笔记, 同步]
+    en: [Notes, Sync]
   about:
     zh: |
-      一个示例网页：登录以后，页面会向你问好。新建插件时可以照着改。
+      Obsidian 装上社区插件 Self-hosted LiveSync 后，几台电脑的笔记实时同步，数据保存在自己家里。
+
+      在插件详情里打开“在局域网开放”，把显示的地址、账号、密码填进 LiveSync 的连接设置，数据库名填 obsidiandb。
+
+      已知限制：手机上的 Obsidian 要求 HTTPS 连接（上游文档写明），家里的服务器还没有局域网 HTTPS 入口，手机暂时连不上；先在电脑之间用。
     en: |
-      An example page: once you are signed in, the page says hello. Copy it as a starting point for a new plugin.
-  release_notes: { zh: 名字和说明更新。, en: Product name and description update. }
-  webui:
-    service: web
-    port: 80
-    # 示例页回显网关注入的用户名，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#网关代登录sso-proxy。
-    sso: proxy
-    proxy:
-      headers:
-        Remote-User: "{user}"
-  # 能放进侧边栏“我的应用”的页面，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#应用页面tabs。放不放由用户决定。
-  tabs:
-    - id: home
-      title: { zh: 主页, en: Home }
-      icon: tabs/home.svg
-      icon_selected: tabs/home-fill.svg
-      path: /
-      # 这个页面没做适配，用默认的 inset：从状态栏下沿开始，页面不用管安全区。
-      # 想让内容从状态栏后面滚过，写 layout: edge-to-edge，并用 --wonton-inset-* 留出系统安全区的位置。
-  permissions: []
-  # 上游 nginx 官方镜像，amd64 和 arm64 都有；上游没写最低内存，按本机空闲实测取整（实测约 24M，取 64M）。
+      Install the Self-hosted LiveSync community plugin in Obsidian, and notes on several computers stay in sync in real time, stored at home.
+
+      Turn on the LAN switch in the plugin details, then enter the address, account and password shown there into LiveSync; database name is obsidiandb.
+
+      Known limitation: Obsidian on phones requires HTTPS (stated in the upstream docs) and there is no LAN HTTPS entry yet, so phones cannot connect for now; use it between computers first.
+  release_notes: { zh: 首个版本。, en: First release. }
+  setup:
+    zh: 在电脑版 Obsidian 安装社区插件 Self-hosted LiveSync，打开本插件的“在局域网开放”，把显示的地址、账号、密码填进 LiveSync 的连接设置，数据库名填 obsidiandb。
+    en: Install the Self-hosted LiveSync community plugin in Obsidian, turn on the LAN switch in this plugin's details, and enter the address, account and password shown there; the database name is obsidiandb.
+  # Obsidian 从局域网直连 CouchDB：地址、账号在详情页显示，密码由核心生成。
+  lan:
+    ports:
+      - { service: couchdb, port: 5984 }
+    client:
+      address: "http://{host}:5984"
+      username: "{user}"
+      password: "{secret:client_password}"
+  secrets:
+    admin_password:
+      generate: { bytes: 32 }
+    client_password:
+      generate: { bytes: 32 }
+  permissions:
+    - network.lan
+    # 知道用户名：客户端账号按注入的用户名建。
+    - owner.identity
+  # 空闲实测约 160M（docker stats）；镜像支持 amd64 和 arm64（docker buildx imagetools inspect）。
   requirements:
     arch: [amd64, arm64]
-    memory: 64M
+    memory: 256M

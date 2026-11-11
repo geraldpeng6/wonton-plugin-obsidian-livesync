@@ -1,61 +1,86 @@
 # shellcheck shell=bash
-# scripts/smoke.sh 的一项一项探测，跟着插件走。没写的项会 FAIL 并给出写法，不会默认放行。
+# Obsidian LiveSync：没有网页（webui 不声明），CouchDB 只在局域网端口上服务 Obsidian 客户端。
+# 探针直接对 CouchDB 发请求：不带账号要被拒；lan.client 的账号能访问库；CORS 放行 Obsidian 桌面端；
+# 数据探针写一个文档验证升级、重装不丢。
 #
-# 变量别叫 state：shellcheck 把这份文件连着 probes.sh 一起分析，probes.sh 自己也读一个 dev.sh 提供的 state；
-# 子壳体函数（fn() ( … )）里给 state 赋值，SC2031 就报在 probes.sh 上，CI 红。
-#
-# 变量：SMOKE_WEB_URL 是应用的网页入口（套件已去尾斜杠，但可能带路径，比如 SSO 登录页）；
-#       拼 API 路径用 SMOKE_WEB_ORIGIN（只有 scheme://host:port，入口的路径不掺进来），别直接接在 SMOKE_WEB_URL 后面。
-#
-# 页面：web_assert 从标准输入读页面，命中的确是应用的真实页面时返回 0。
-# 身份：identity_check 只证明身份：用应用自己的“当前用户”接口断言认出的是用户管理员，不碰应用里的数据。
-#       数据断言（是否配置过、有几条、内容对不对）全部交给 data_write / data_check：冒烟第 1 项会先装升级
-#       起点写数据，身份探针再断言“数据目录是空的”就会红。接口回字段时也只看类型（如 configured 是布尔、
-#       nodes 是数字），值和条数留给 data_check。
-#       没有用户体系时写 IDENTITY_NA=1，并在 SMOKE_NOTE 里写原因。dweb / web_get 是带用户会话的请求助手，可继续走应用自己的登录链。
-#       SSO 登录跳转不用自己写表单逻辑：dweb --sso 会从清单 webui.path 的入口出发（没写就是 /），提交核心
-#       登录页的 JS 自动表单并跟完重定向，返回的页面已带应用的登录态。
-# 工具：MCP_TOOL 写一个只读工具名（可带插件前缀），MCP_ARGS 是 JSON 参数；mcp_assert 从标准输入读调用结果。
-#       要断言多个工具时改成写 mcp_check；调用前要备数据时写 before_mcp。
-# 通知房间：申请了 notify 的插件把通知交给核心，核心以核心账号发进和主人的“Wonton”私聊。
-#       探针以主人身份读这个房间：probes_owner_room_wait <超时秒> <要找的文字> 等到开始之后发来的、包含这段文字的
-#       消息就返回 0，超时列出看到的最新消息并返回非 0。要先把等待挂到后台再发通知，否则消息可能在等待开始前就到：
-#         room_wait() {
-#           local marker="probe-$RANDOM" url
-#           url="$(docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" printenv WONTON_NOTIFY_URL)"
-#           probes_owner_room_wait 120 "$marker" & local pid=$!
-#           docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" wget -q -O /dev/null \
-#             --header 'Content-Type: application/json' --post-data "{\"title\":\"$marker\"}" "$url"
-#           wait "$pid"
-#         }
-#       上面的 web 换成插件里能发 HTTP 的服务；wget 换成那个服务里有的客户端。
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：data_write 用随机标记写
-#       一条数据并把标记原样存进 $SMOKE_STATE，data_check 读回标记去应用里找，对不上就打印看到了什么并返回非 0。
-#       应用不存用户数据时写 DATA_NA=1（两项记 N/A）。
-# 装之前要准备（如先配出口代理）：写 before_install。
+# 变量：SMOKE_STATE 是存数据标记的文件；SMOKE_JAR/SMOKE_WEB_URL 用不上（没有网关入口）。
+# 请求从插件网络里的一次性 curl 容器发出（插件网络不出网，宿主连不进去）：
+#   _container <插件 id> <服务名>  按核心标签找本实例里这个服务的容器
+#   _curl <参数…>                 在插件网络里跑一次 curlimages/curl（镜像与 init 服务同一个）
 
-web_assert() { grep -q '你好'; }   # 示例页的标题
-
-identity_check() { # 页面回显的就是网关注入的用户名；示例页不存数据，也不拿数据判断身份
-  local page
-  page="$(dweb /)" || { echo "页面失败：$page"; return 1; }
-  grep -qF "你好，$SMOKE_OWNER" <<<"$page" || { echo "页面没回显用户 $SMOKE_OWNER：$(head -c 120 <<<"$page")"; return 1; }
+_container() { # <插件 id> <服务名>：本实例里这个服务的容器
+  local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=$1" --filter "label=wonton.service=$2")
+  if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
+    inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
+  fi
+  [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
+  # init 是一次性服务，装完就退出：要能看到已退出的容器（docker ps -a）。
+  docker ps -a --format '{{.Names}}' "${args[@]}" | head -1
 }
 
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：
-#   data_write 用随机标记写一条数据，把标记原样覆盖写进 $SMOKE_STATE（一个已建好的空文件，不是目录）；data_check 读回标记、去应用里找，
-#   找不到就打印看到了什么并返回非 0。
-# 应用不存用户数据时写 DATA_NA=1（两项记 N/A）。模板的示例页不存数据，所以这里是不适用。
-# 数据要写进插件容器时（Agent 插件的工作区标记等），容器名别自己拼：钩子契约里没有 SMOKE_SLUG，e2e 套件的
-# data_write 又跑在实例名导出之前，拼出来的名字缺段（No such container）；Bot 服务（清单声明了 bots）每个 Bot
-# 一组容器，名字还带 --<Bot 名> 后缀。按核心打的标签找，插件自带 smoke 和 e2e 套件两个运行环境都成立
-# （实例名没导出时按 SMOKE_BASE 的主机名第一段推）：
-#   _container() { # <插件 id> <服务名>：本实例里这个服务的容器
-#     local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=$1" --filter "label=wonton.service=$2")
-#     if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
-#       inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
-#     fi
-#     [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
-#     docker ps --format '{{.Names}}' "${args[@]}" | head -1
-#   }
-export DATA_NA=1
+_init_image() { # init 一次性服务用的镜像（和 compose 里的 curlimages/curl 同一个摘要）
+  local ct; ct="$(_container "$PROBES_PLUGIN_ID" init)"
+  [[ -n "$ct" ]] || { echo "找不到 init 容器"; return 1; }
+  docker inspect --format '{{.Config.Image}}' "$ct"
+}
+
+_curl() { # <参数…>：对 couchdb 服务名发请求
+  local img net
+  img="$(_init_image)" || { echo "$img"; return 1; }
+  net="$(docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
+    "$(_container "$PROBES_PLUGIN_ID" couchdb)")"
+  docker run --rm --network "${net%% *}" "$img" "$@" 2>&1
+}
+
+_client_creds() { # 客户端账号：init 容器 env 里的用户名和核心生成的密码（密码不回显）
+  local ct
+  ct="$(_container "$PROBES_PLUGIN_ID" init)"
+  [[ -n "$ct" ]] || { echo "找不到 init 容器"; return 1; }
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$ct" \
+    | awk -F= '/^WONTON_OWNER_NAME=/{u=$2} /^WONTON_SECRET_CLIENT_/{p=substr($0, index($0,"=")+1)} END{print u "\t" p}'
+}
+
+data_write() {
+  local unauth code origin creds user pw marker body
+  echo "-- CouchDB /_up 与身份"
+
+  unauth="$(_curl -s -o /dev/null -w '%{http_code}' http://couchdb:5984/_up)"
+  [ "$unauth" = "401" ] || { echo "不带账号访问 /_up 得到 $unauth，要 401"; return 1; }
+  echo "   不带账号访问 /_up：401"
+
+  origin="$(_curl -s -D - -o /dev/null -X OPTIONS http://couchdb:5984/ \
+    -H 'Origin: app://obsidian.md' -H 'Access-Control-Request-Method: PUT' \
+    -H 'Access-Control-Request-Headers: content-type' | tr -d '\r' \
+    | sed -n 's/^[Aa]ccess-[Cc]ontrol-[Aa]llow-[Oo]rigin: //p')"
+  [ "$origin" = "app://obsidian.md" ] || { echo "CORS 预检没有放行 app://obsidian.md：${origin:-无}"; return 1; }
+  echo "   CORS 预检放行 app://obsidian.md"
+
+  creds="$(_client_creds)" || { echo "$creds"; return 1; }
+  user="${creds%%$'\t'*}"
+  pw="${creds#*$'\t'}"
+  [[ -n "$user" && -n "$pw" ]] || { echo "init 容器里没有客户端账号信息"; return 1; }
+
+  code="$(_curl -s -o /dev/null -w '%{http_code}' -u "$user:$pw" http://couchdb:5984/obsidiandb)"
+  [ "$code" = "200" ] || { echo "客户端账号 $user 访问 obsidiandb 得到 $code，要 200"; return 1; }
+  echo "   客户端账号 $user 访问 obsidiandb：200"
+
+  marker="wonton-smoke-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  code="$(_curl -s -o /dev/null -w '%{http_code}' -u "$user:$pw" -X PUT "http://couchdb:5984/obsidiandb/smoke-probe" \
+    -H 'Content-Type: application/json' -d "{\"marker\":\"$marker\"}")"
+  [ "$code" = "201" ] || [ "$code" = "202" ] || { echo "写探针文档得到 $code"; return 1; }
+  printf '%s' "$marker" >"$SMOKE_STATE"
+  echo "   写入文档 smoke-probe（标记 $marker）"
+}
+
+data_check() { # 重装、升级后文档还在，标记一致
+  local marker body creds user pw got
+  marker="$(cat "$SMOKE_STATE")"
+  [[ -n "$marker" ]] || { echo "SMOKE_STATE 里没有标记"; return 1; }
+  creds="$(_client_creds)" || { echo "$creds"; return 1; }
+  user="${creds%%$'\t'*}"
+  pw="${creds#*$'\t'}"
+  body="$(_curl -s -u "$user:$pw" http://couchdb:5984/obsidiandb/smoke-probe)"
+  got="$(jq -r '.marker // empty' <<<"$body" 2>/dev/null)"
+  [ "$got" = "$marker" ] || { echo "文档里的标记是 ${got:-无}，要 $marker：$(head -c 200 <<<"$body")"; return 1; }
+  echo "   重装后 smoke-probe 的标记还在：$got"
+}

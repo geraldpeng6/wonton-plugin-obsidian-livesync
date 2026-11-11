@@ -1,43 +1,39 @@
-# 云吞插件模板
+# 笔记同步（Obsidian LiveSync）
 
-开发流程见[插件开发指南](https://github.com/wontonapp/wonton-docs/blob/main/develop.md)。
+让家里几台电脑上的 [Obsidian](https://obsidian.md) 笔记实时同步：Obsidian 装上社区插件
+[Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync)（MIT），通过局域网连到本插件提供的
+[CouchDB](https://couchdb.apache.org)（Apache-2.0）数据库，笔记自动互相同步。数据保存在自己家里，不用订阅
+Obsidian 官方的 Sync 服务，也没有第三方服务器经手。
 
-这是一个能安装的示例插件 `app.example.hello`：使用 nginx 官方镜像显示问候页，经网关的 `sso: proxy` 注入用户名，页面显示“你好，<用户名>”。示例没有应用账号、持久化数据或 MCP 工具。
+## 怎么用
 
-## 示例文件
+1. 装好本插件后，在插件详情里打开“在局域网开放”，记下显示的地址、账号和密码。
+2. 在电脑版 Obsidian 里安装社区插件 **Self-hosted LiveSync**。
+3. 在 LiveSync 的连接设置里填：服务器地址、账号、密码（都来自第 1 步），数据库名填 `obsidiandb`。
+4. 按插件引导完成第一次同步，其他电脑重复第 2–3 步即可。
 
-| 路径 | 内容 |
-| --- | --- |
-| `docker-compose.yml` | 示例清单、nginx 服务和三个 `configs` |
-| `web/default.conf.template` | nginx 配置，启用 SSI 回显用户名并提供健康检查入口；只放行来自核心地址（`${WONTON_CORE_ADDRESS}`）的请求，其余来源 403 |
-| `web/index.html` | 问候页 |
-| `web/tokens.css` | 页面主题变量的后备值 |
-| `tabs/` | 示例主页的应用页面图标 |
-| `screenshots/home.png` | 商店详情页的示例截图 |
-| `scripts/smoke-probes.sh` | 检查真实页面和网关注入身份的插件探针 |
+上游文档：<https://github.com/vrtmrz/obsidian-livesync/blob/main/docs/setup_own_server.md>
 
-从模板创建自己的插件后，替换示例清单、网页和素材；具体步骤见[写插件](https://github.com/wontonapp/wonton-docs/blob/main/develop.md#写插件)。
+## 数据存在哪、备份要注意什么
 
-## 对着别的栈跑探针
+- 全部笔记存在插件的数据目录里（`WONTON_APP_DATA/data`，容器内 `/opt/couchdb/data`），没有别的副本。
+- 备份直接拷贝这个目录即可；拷贝前先在插件详情里停止插件（CouchDB 运行中直接拷贝可能得到不完整的文件）。
+- LiveSync 本身支持端到端加密（在 Obsidian 的 LiveSync 设置里开“加密”），开了之后服务器上存的是密文。
 
-`probes`、`api`、`session` 按 `.wonton/.env` 的 `WONTON_BASE_DOMAIN` 拼核心地址，`up` 起的栈自己写这个键。插件装进别人的栈、或者对着已有环境排查时，把那套栈的基础域名写进 `.wonton/.env`，不要只按实例名猜地址：实例名只是资源名前缀，网关按 Host 认域名，拼错了会回“没有安装”。
+## 已知限制
 
-```bash
-WONTON_BASE_DOMAIN=wonton.localhost
-```
+- **手机连不上**：上游文档明确要求移动端用 HTTPS 且证书要系统信任（“Obsidian Mobile requires HTTPS”，
+  见 setup_own_server.md 与 troubleshooting.md；自签证书也不行，见上游 issue #569）。当前插件底座只提供
+  局域网 HTTP 端口，没有局域网 HTTPS 入口，所以手机上的 Obsidian 暂时连不上，先在电脑之间用。
+- 没有给人用的网页：CouchDB 的管理页（Fauxton）不对普通用户开放，插件也不声明网页入口。
 
-## 核心镜像
+## 权限
 
-检查和冒烟默认用套件里的核心镜像（`ghcr.io/wontonapp/wonton-core:main`）；要固定别的核心镜像，在仓库 Settings → Variables 设 `WONTON_CORE_IMAGE`，手动触发“检查”时填的 `core-image` 输入优先。
+- `network.lan`：在局域网上开放 5984 端口，Obsidian 直连这里同步。
+- `owner.identity`：客户端账号用你的用户名，密码由核心生成。
 
-## 更新开发套件
+## 许可证和商标
 
-```bash
-scripts/dev.sh kit-update
-```
-
-在从模板新建的插件仓库中更新套件；本仓库是套件源头，执行时只提示并退出。版本、可选引用和自定义脚本约定见[开发指南](https://github.com/wontonapp/wonton-docs/blob/main/develop.md#更新开发套件)。
-
-## 图标
-
-`icon.svg` 是本仓库原创线条图标，按本仓库 MIT 许可证分发，见 [NOTICE](NOTICE)。
+- 插件包：MIT，见 [LICENSE](LICENSE)；素材声明见 [NOTICE](NOTICE)。
+- 服务端 Apache CouchDB：Apache License 2.0（官方镜像 `couchdb`）。
+- 客户端 Self-hosted LiveSync：MIT。Obsidian 是 Dynalist Inc. 的商标；本插件与上游项目无从属关系。
